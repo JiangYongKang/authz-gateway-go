@@ -10,6 +10,7 @@
 //	POST /v1/tokens/revoke          按凭证撤销其会话
 //	POST /v1/authorize              凭证 + 资源 + 动作判定
 //	GET  /v1/audit?after_id=N       查询审计记录
+//	GET  /v1/audit/export?from=&to= 导出自包含审计证据（可离线核验）
 //	GET  /v1/keys                   查询密钥元数据（无明文）
 //	POST /v1/admin/policies         upsert 策略
 //	DELETE /v1/admin/policies/{id}  删除策略
@@ -44,6 +45,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/tokens/revoke", s.revokeByToken)
 	mux.HandleFunc("POST /v1/authorize", s.authorize)
 	mux.HandleFunc("GET /v1/audit", s.audit)
+	mux.HandleFunc("GET /v1/audit/export", s.auditExport)
 	mux.HandleFunc("GET /v1/keys", s.listKeys)
 	mux.HandleFunc("POST /v1/admin/policies", s.upsertPolicy)
 	mux.HandleFunc("DELETE /v1/admin/policies/{id}", s.deletePolicy)
@@ -181,6 +183,31 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+}
+
+// auditExport 导出自包含审计证据。范围不合法 => 400，超上限 => 413，
+// 其它审计故障 => 503；失败时绝不返回半成品产物。
+func (s *Server) auditExport(w http.ResponseWriter, r *http.Request) {
+	var from, to int64
+	if !parseInt64(w, r.URL.Query().Get("from"), &from) {
+		return
+	}
+	if !parseInt64(w, r.URL.Query().Get("to"), &to) {
+		return
+	}
+	ev, err := s.gw.ExportAudit(from, to)
+	if err != nil {
+		switch gateway.ExportReasonOf(err) {
+		case gateway.ReasonExportRangeInvalid:
+			writeJSON(w, http.StatusBadRequest, errBody(gateway.ReasonExportRangeInvalid, err.Error()))
+		case gateway.ReasonExportLimit:
+			writeJSON(w, http.StatusRequestEntityTooLarge, errBody(gateway.ReasonExportLimit, err.Error()))
+		default:
+			writeJSON(w, http.StatusServiceUnavailable, errBody("audit_failure", err.Error()))
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, ev)
 }
 
 func (s *Server) listKeys(w http.ResponseWriter, r *http.Request) {

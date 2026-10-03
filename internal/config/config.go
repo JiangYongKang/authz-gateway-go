@@ -12,6 +12,7 @@ type Config struct {
 	MaxKeys       int
 	DecisionCache int           // 正面判定缓存条目上限，0 表示关闭
 	AuditCapacity int           // 审计记录上限，<=0 表示不限
+	MaxExport     int           // 单次审计证据导出允许的条数上限，0 表示用默认值
 	TokenTTL      time.Duration // 凭证默认有效期
 	RenewWindow   time.Duration // 过期前可续期的时间窗（0 表示任何未过期时刻都可续期）
 	DecisionTTL   time.Duration // 正面判定缓存有效期
@@ -30,6 +31,7 @@ func Defaults() Config {
 		MaxKeys:       16,
 		DecisionCache: 256,
 		AuditCapacity: 100_000,
+		MaxExport:     10_000,
 		TokenTTL:      time.Hour,
 		RenewWindow:   30 * time.Minute,
 		DecisionTTL:   10 * time.Second,
@@ -62,6 +64,9 @@ func (c Config) MergeDefaults() Config {
 	}
 	if c.AuditCapacity == 0 {
 		c.AuditCapacity = d.AuditCapacity
+	}
+	if c.MaxExport == 0 {
+		c.MaxExport = d.MaxExport
 	}
 	if c.TokenTTL == 0 {
 		c.TokenTTL = d.TokenTTL

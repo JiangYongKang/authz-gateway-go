@@ -15,7 +15,7 @@
 | `internal/token` | HS256（JWT 紧凑序列化）凭证的签发、解析与验签，返回**可区分**的哨兵错误 |
 | `internal/store` | 内存存储：用户/资源/策略/密钥/会话；单锁串行化、容量上限、故障注入、CAS 续期、原子轮换 |
 | `internal/authz` | 无状态 RBAC+ABAC 判定引擎；默认拒绝、显式拒绝优先、顺序无关 |
-| `internal/audit` | 有界、只追加、不可改写的审计日志（防御性拷贝） |
+| `internal/audit` | 有界、只追加、不可改写的审计日志（防御性拷贝）；自包含证据导出与离线核验 |
 | `internal/cache` | 有容量上限、带 TTL 的 LRU 正面判定缓存 |
 | `internal/config` | 判定规模与容量上限配置 |
 | `internal/gateway` | 编排层：签发/校验/续期/撤销/轮换/判定/审计，所有入口共享同一套逻辑 |
@@ -145,12 +145,50 @@
 - 审计容量（`AuditCapacity`）写满后 `Append` 返回 `ErrAuditFull`，
   敏感操作（签发/撤销/轮换/改策略/改角色）随之**拒绝执行**，绝不静默跳过。
 
+### 5.1 审计证据导出与独立核验
+
+面向外部合规审计：把一段记录导出为**自包含证据产物**（JSON），
+交给完全独立的一方——另起进程或外部工具，**无需任何服务访问权限**
+即可自行核验。
+
+- **导出**：`Gateway.ExportAudit(from, to)`（Go API）或
+  `GET /v1/audit/export?from=&to=`（HTTP），导出 `[from,to]` 闭区间。
+  产物格式 `audit-evidence/v1`：声明范围 + 每条记录（事件本体 + 链上摘要）
+  + 头摘要。哈希链以「格式标识 + 范围」为起点逐条推进，
+  核验方仅凭产物自身即可完整重放。
+- **独立核验**：`audit.VerifyEvidence(data)`（纯函数，不碰任何服务端状态）
+  或独立工具 `cmd/audit-verify`（`audit-verify evidence.json`，
+  结论为 ok 时退出码 0）。结论**可区分**，绝不笼统报失败：
+  - `ok` —— 该段记录完整连续、未被改写；
+  - `sequence_broken` —— 中间缺号、序号重复或顺序被重排；
+  - `tampered` —— 某条内容（含嵌套的 detail）被事后改写，或摘要被换；
+  - `invalid_range` —— 产物声明的范围本身不合法（区间倒置、条数与区间不符）；
+  - `malformed` —— 产物无法解析或格式标识不符。
+- **一致性边界**：序号由同一把锁单调分配且只追加，导出在锁内拷贝切片、
+  锁外算哈希，因此每份产物都是某个一致边界——无半条记录、无跳号、
+  无重复；与并发写入同时进行也自洽，且不长时间阻塞签发/判定/变更。
+  对同一范围重复导出，结果**逐字节一致**。
+- **离不可改**：产物是深拷贝。对方怎么读、怎么转发、就地改动（包括嵌套
+  内容）都不影响服务端记录；之后再查、再导出仍是原值，
+  未被动过的那份产物再核验仍通过。
+- **不含敏感材料**：记录本身只含 `jti` 等业务字段，导出的产物同样
+  不含凭证原文与签名密钥。
+- **规模上限**：单次导出条数由 `config.MaxExport` 限制（默认 10000）。
+  拒绝原因可区分：范围不合法 → `export_range_invalid`（HTTP 400），
+  超上限 → `export_limit_exceeded`（HTTP 413）；
+  失败时不产生任何半成品产物，也不留下占着不放的资源。
+- **边界与兼容**：核验保证的是「该导出段内部完整连续且未被改写」；
+  它不证明该段与服务端更早历史的衔接（段前历史不在产物内）。
+  产物格式标识为 `audit-evidence/v1`，未来格式变更会换新标识，
+  核验方按标识决定兼容性。
+
 ---
 
 ## 6. 容量上限与故障策略
 
 `config.Config`（见 `internal/config`）可限制：用户/资源/策略/会话/密钥
-数量、判定缓存条数、审计容量、规则数、请求属性数等。
+数量、判定缓存条数、审计容量、单次审计证据导出条数（`MaxExport`）、
+规则数、请求属性数等。
 
 - 超限：返回 `limit_exceeded`（HTTP 429）/ 相应拒绝原因，不降级放行。
 - 存储写失败（可用 `Store.SetFailNext(n)` 注入）：故障在**任何状态修改
@@ -240,6 +278,13 @@ curl -s $BASE/v1/keys
 
 # 10) 审计（只含 jti，无 token/密钥）
 curl -s "$BASE/v1/audit?after_id=0" | python3 -m json.tool | head -40
+
+# 11) 导出审计证据并用独立进程离线核验
+curl -s "$BASE/v1/audit/export?from=1&to=5" > evidence.json
+go run ./cmd/audit-verify evidence.json
+# => {"verdict":"ok","records":5}   （退出码 0）
+# 改动产物任意内容（含嵌套 detail）再核验 => {"verdict":"tampered",...}，退出码 1
+# 范围不合法 => HTTP 400 export_range_invalid；超 MaxExport => HTTP 413 export_limit_exceeded
 ```
 
 ### 7.3 自动化测试
@@ -261,4 +306,8 @@ go test -v ./internal/gateway      # 过期/篡改/并发续期/并发轮换/撤
 - 8 路并发轮换：恰好 1 次成功，最终唯一 active；
 - 撤销与判定并发：撤销完成后结论稳定为 `session_revoked`；
 - 存储故障注入：失败不留会话、不残留部分写入、后续请求自愈；
-- 策略删除后回退为默认拒绝；审计容量打满后敏感操作被拒。
+- 策略删除后回退为默认拒绝；审计容量打满后敏感操作被拒；
+- 审计证据导出：独立进程核验通过；缺号/重复/重排判 `sequence_broken`，
+  改写（含嵌套 detail）判 `tampered`，范围不合法判 `invalid_range`；
+  外部改动导出副本不影响服务端记录与再次导出；并发导出与写入自洽；
+  超 `MaxExport` 明确拒绝（`export_limit_exceeded`）且不留半成品。
