@@ -10,6 +10,8 @@
 //	POST /v1/tokens/revoke          按凭证撤销其会话
 //	POST /v1/authorize              凭证 + 资源 + 动作判定
 //	GET  /v1/audit?after_id=N       查询审计记录
+//	GET  /v1/audit/evidence?from=&to= 导出可离线核验的审计证据
+//	GET  /v1/audit/evidence/key    查询证据导出签名公钥（无私钥）
 //	GET  /v1/keys                   查询密钥元数据（无明文）
 //	POST /v1/admin/policies         upsert 策略
 //	DELETE /v1/admin/policies/{id}  删除策略
@@ -44,6 +46,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/tokens/revoke", s.revokeByToken)
 	mux.HandleFunc("POST /v1/authorize", s.authorize)
 	mux.HandleFunc("GET /v1/audit", s.audit)
+	mux.HandleFunc("GET /v1/audit/evidence", s.auditEvidence)
+	mux.HandleFunc("GET /v1/audit/evidence/key", s.auditEvidenceKey)
 	mux.HandleFunc("GET /v1/keys", s.listKeys)
 	mux.HandleFunc("POST /v1/admin/policies", s.upsertPolicy)
 	mux.HandleFunc("DELETE /v1/admin/policies/{id}", s.deletePolicy)
@@ -183,6 +187,34 @@ func (s *Server) audit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
 }
 
+func (s *Server) auditEvidence(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var from, to int64
+	if q.Get("from") == "" || q.Get("to") == "" {
+		writeJSON(w, http.StatusBadRequest, errBody(gateway.ReasonExportInvalidRange,
+			"query parameters from and to are required"))
+		return
+	}
+	if !parseInt64(w, q.Get("from"), &from) || !parseInt64(w, q.Get("to"), &to) {
+		return
+	}
+	a, err := s.gw.ExportAuditEvidence(from, to)
+	if err != nil {
+		writeGatewayError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+func (s *Server) auditEvidenceKey(w http.ResponseWriter, r *http.Request) {
+	info, err := s.gw.EvidencePublicKey()
+	if err != nil {
+		writeGatewayError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
 func (s *Server) listKeys(w http.ResponseWriter, r *http.Request) {
 	keys, err := s.gw.ListKeys(r.Context())
 	if err != nil {
@@ -312,11 +344,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeGatewayError(w http.ResponseWriter, err error) {
 	reason := gateway.ReasonOf(err)
 	switch reason {
-	case "user_not_found", "bad_request":
+	case "user_not_found", "bad_request", gateway.ReasonExportInvalidRange:
 		writeJSON(w, http.StatusBadRequest, errBody(reason, err.Error()))
 	case "storage_failure", "audit_failure":
 		writeJSON(w, http.StatusServiceUnavailable, errBody(reason, err.Error()))
-	case "limit_exceeded":
+	case "limit_exceeded", gateway.ReasonExportTooMany, gateway.ReasonExportTooLarge:
 		writeJSON(w, http.StatusTooManyRequests, errBody(reason, err.Error()))
 	default:
 		writeJSON(w, http.StatusForbidden, errBody(reason, err.Error()))

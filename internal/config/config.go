@@ -17,7 +17,15 @@ type Config struct {
 	DecisionTTL   time.Duration // 正面判定缓存有效期
 	MaxRuleCount  int           // 单次判定最多求值的规则数，0 表示不限
 	MaxAttrCount  int           // 单次请求允许携带的属性数量上限，0 表示不限
-	Issuer        string        // 期望的凭证签发者
+	// AuditExportMaxRecords 单次审计证据导出允许的最大记录条数，<=0 表示不限。
+	AuditExportMaxRecords int
+	// AuditExportMaxBytes 单次审计证据导出产物允许的最大字节数，<=0 表示不限。
+	AuditExportMaxBytes int
+	// AuditEvidenceKeySeed 导出证据 Ed25519 签名密钥的 32 字节种子；
+	// 留空时每次启动随机生成（重启后旧产物仍可离线核验，只是核验工具无法
+	// 再通过“期望 key_id”与服务关联；部署时应注入固定种子并妥善保管）。
+	AuditEvidenceKeySeed []byte
+	Issuer               string // 期望的凭证签发者
 }
 
 // Defaults 返回带默认上限的配置。
@@ -35,7 +43,11 @@ func Defaults() Config {
 		DecisionTTL:   10 * time.Second,
 		MaxRuleCount:  500,
 		MaxAttrCount:  64,
-		Issuer:        "authz-gateway-local",
+		// 单次导出上限：1 万条 / 8 MiB。证据导出面向“一段记录”的合规核验，
+		// 不应被当成全量转储通道。
+		AuditExportMaxRecords: 10_000,
+		AuditExportMaxBytes:   8 << 20,
+		Issuer:                "authz-gateway-local",
 	}
 }
 
@@ -74,6 +86,12 @@ func (c Config) MergeDefaults() Config {
 	}
 	if c.MaxAttrCount == 0 {
 		c.MaxAttrCount = d.MaxAttrCount
+	}
+	if c.AuditExportMaxRecords == 0 {
+		c.AuditExportMaxRecords = d.AuditExportMaxRecords
+	}
+	if c.AuditExportMaxBytes == 0 {
+		c.AuditExportMaxBytes = d.AuditExportMaxBytes
 	}
 	if c.Issuer == "" {
 		c.Issuer = d.Issuer

@@ -16,11 +16,13 @@
 | `internal/store` | 内存存储：用户/资源/策略/密钥/会话；单锁串行化、容量上限、故障注入、CAS 续期、原子轮换 |
 | `internal/authz` | 无状态 RBAC+ABAC 判定引擎；默认拒绝、显式拒绝优先、顺序无关 |
 | `internal/audit` | 有界、只追加、不可改写的审计日志（防御性拷贝） |
+| `internal/evidence` | 审计证据导出（哈希链 + Ed25519 签名）与**完全离线**核验 |
 | `internal/cache` | 有容量上限、带 TTL 的 LRU 正面判定缓存 |
 | `internal/config` | 判定规模与容量上限配置 |
-| `internal/gateway` | 编排层：签发/校验/续期/撤销/轮换/判定/审计，所有入口共享同一套逻辑 |
+| `internal/gateway` | 编排层：签发/校验/续期/撤销/轮换/判定/审计/证据导出，所有入口共享同一套逻辑 |
 | `internal/httpserver` | 本地 HTTP JSON 入口 |
 | `cmd/authz-gateway` | 可直接运行的演示服务（含种子数据） |
+| `cmd/audit-evidence-verify` | 审计证据产物的**独立离线核验工具**（不访问服务） |
 
 ---
 
@@ -145,6 +147,101 @@
 - 审计容量（`AuditCapacity`）写满后 `Append` 返回 `ErrAuditFull`，
   敏感操作（签发/撤销/轮换/改策略/改角色）随之**拒绝执行**，绝不静默跳过。
 
+### 5.1 审计证据导出与离线核验（合规对接）
+
+除了服务自己按序号回查，还可以把**一段记录导出成一份自包含产物**，交给
+完全独立的一方（另一个进程、外部合规工具）在**没有任何服务访问权限**的
+情况下自行核验。入口：
+
+- `GET /v1/audit/evidence?from=N&to=M`：导出 ID 闭区间 `[N,M]` 的证据；
+- `GET /v1/audit/evidence/key`：查询导出签名公钥与 `key_id`（**不含私钥**）；
+- Go API：`gateway.Gateway.ExportAuditEvidence(from,to)`、`EvidencePublicKey()`；
+- 核验逻辑：`internal/evidence.Verify(bytes)`，只依赖 Go 标准库；
+- 命令行：`cmd/audit-evidence-verify`（可拷贝到任意机器单独编译运行）。
+
+**产物结构**（紧凑 JSON，字段顺序固定，下同）：
+
+```jsonc
+{
+  "format_version": 1,
+  "chain_alg": "SHA-256",
+  "sig_alg": "Ed25519",
+  "key_id": "<导出公钥的 SHA-256，hex>",
+  "range_from": 1, "range_to": 100,
+  "anchor_hash": "<范围前一条记录的链哈希；from=1 时为空串>",
+  "root_hash":   "<重放完该区间最后一条记录后的链哈希>",
+  "records": [
+    { "id": 1, "time": "...RFC3339Nano(UTC)...", "operation": "...",
+      "jti": "...", "detail": { ... },
+      "hash": "hex( H( prev_hash || '.' || 规范化JSON(本条内容) ) )" }
+    // ...
+  ],
+  "public_key": "base64url(32字节 Ed25519 公钥)",
+  "signature":  "base64url( Ed25519私钥签名(规范化JSON(范围+锚点+根)) )"
+}
+```
+
+**核验保证到哪一步**。核验方只需要产物字节，按固定顺序得到**互相可区分**
+的结论，绝不会把不完整内容当通过：
+
+| 结论 `status` | 含义 |
+| --- | --- |
+| `valid` | 范围合法、序号连续、哈希链完整、内容未改、导出方签名有效 |
+| `invalid_range` | 产物声明的范围本身不合法（`from<1` 或 `to<from`） |
+| `missing_records` | 中间**缺号**（前向跳号），并指出 `want_id/got_id` |
+| `reordered_or_dup` | 记录被**重排或序号重复**（后向出现更小序号） |
+| `content_tampered` | 某条记录内容（含**嵌套的 `detail`**）被事后改写，指出 `at_id` |
+| `root_mismatch` | 记录链重算出的根与声明的 `root_hash` 不一致 |
+| `bad_evidence_signature` | Ed25519 签名不通过，或 `key_id` 与内嵌公钥不绑定 |
+| `artifact_malformed` | 不是合法 JSON、字段缺失、编码错误、记录条数与声明范围不符等 |
+| `unsupported_key_alg` | 不支持的 `format_version / chain_alg / sig_alg` |
+
+**单向隔离（导出副本不可反噬服务端）**：
+
+- 产物在审计锁内取**深拷贝快照**后在锁外计算哈希与签名；对方对产物字节的
+  任何读取、转发、就地改动（包括嵌套 `detail`）都不可能触及服务端记录；
+  之后服务端再查、再导出，拿到的仍是原值；
+- 同一范围重复导出的产物**字节一致**（产物不含“导出时刻”等易变字段）；
+  未被改动的同一份产物重复核验结论一致。
+
+**敏感内容**：产物字段与审计记录一致——凭证只记 `jti`，不含 token 本体，
+不含任何签名密钥；导出签名私钥/种子永不进入产物，产物只携带公钥。
+
+**一致性与不阻塞写入**：导出基于单次快照，不会出现半条记录、重复序号或
+莫名跳号；只在内存拷贝期间短暂持锁，逐条哈希与签名均在锁外完成，不长时间
+卡住签发、判定与变更。
+
+**边界（请务必知悉）**：
+
+1. 核验只证明“这份产物与**导出方私钥**对应的签名一致、内部链完整”。
+   私钥泄露后，持有者可伪造一份自洽产物；请用带外渠道保管种子并只分发公钥。
+   核验工具支持 `-expect-key KEYID` 把产物绑定到你信任的那把公钥，
+   还可用 `-expect-from/-expect-to` 绑定期望范围，拒绝“另一把合法密钥/另一段
+   合法范围”的产物冒充本次证据。
+2. 核验**不联网**、不判断“区间之外是否还缺记录”。若要证明某段之后没有隐藏
+   记录，应导出到当时的末尾 ID（`GET /v1/audit` 可查当前长度），或要求相邻
+   区间产物的 `anchor_hash` 首尾相接。
+3. 未配置固定种子时，服务每次启动使用随机证据密钥（重启后旧产物仍可用其
+   内嵌公钥正常离线核验，但无法再与“当前服务的 key_id”关联）。生产部署应
+   通过 `-evidence-seed` 注入 32 字节固定种子（hex 或 base64）。
+4. 证据导出不是全量转储通道：受 `AuditExportMaxRecords`（默认 10,000 条）与
+   `AuditExportMaxBytes`（默认 8 MiB）双重约束。
+
+**导出被拒时原因可区分，且不产生半成品**：
+
+| 场景 | 哨兵错误（`internal/evidence`） | 网关原因码 | HTTP |
+| --- | --- | --- | --- |
+| `from<1` 或 `from>to` | `ErrInvalidRange` | `export_invalid_range` | 400 |
+| `to` 超过当前已提交记录 | `ErrRangeUnavailable` | `export_range_unavailable` | 403 |
+| 条数超上限 | `ErrTooManyRecords` | `export_too_many_records` | 429 |
+| 产物字节超上限 | `ErrTooLarge` | `export_too_large` | 429 |
+
+**兼容性**：产物格式以 `format_version` 标识，当前为 `1`。规范化哈希对字段
+顺序敏感（Go `encoding/json` 按结构体声明序输出，map 的 key 按字典序），
+核验端只要求能解析该 JSON 结构、实现 SHA-256 与 Ed25519 即可，不依赖本仓库
+代码；时间统一为 UTC 的 RFC3339Nano 字符串。后续不兼容变更会提升版本号，
+旧版本核验器对未知版本返回 `unsupported_key_alg` 而不是误判通过。
+
 ---
 
 ## 6. 容量上限与故障策略
@@ -240,6 +337,28 @@ curl -s $BASE/v1/keys
 
 # 10) 审计（只含 jti，无 token/密钥）
 curl -s "$BASE/v1/audit?after_id=0" | python3 -m json.tool | head -40
+
+# 11) 导出审计证据并交给独立工具离线核验
+go build -o /tmp/aev ./cmd/audit-evidence-verify
+KID=$(curl -s $BASE/v1/audit/evidence/key | python3 -c 'import sys,json;print(json.load(sys.stdin)["key_id"])')
+curl -s "$BASE/v1/audit/evidence?from=1&to=5" > evidence.json
+/tmp/aev -expect-key "$KID" -expect-from 1 -expect-to 5 evidence.json
+# => status: valid ; exit=0
+
+# 12) 外部篡改（哪怕改的是嵌套 detail）必然被识别
+python3 - <<'PY'
+import json
+a=json.load(open('evidence.json'))
+a['records'][0]['actor']='mallory'
+a['records'][1]['detail']={'injected':'x'}
+json.dump(a,open('evidence-tampered.json','w'))
+PY
+/tmp/aev evidence-tampered.json
+# => status: content_tampered, at_id=1 ; exit=5
+
+# 13) 拒绝原因可区分
+curl -s -i "$BASE/v1/audit/evidence?from=5&to=2"   # 400 export_invalid_range
+curl -s -i "$BASE/v1/audit/evidence?from=1&to=999999" # 403 export_range_unavailable
 ```
 
 ### 7.3 自动化测试
@@ -249,6 +368,7 @@ go test ./...                      # 全量
 go test -race ./...                # 含数据竞争检测
 go test -v ./internal/authz        # 冲突规则/默认拒绝/ABAC/规模上限
 go test -v ./internal/gateway      # 过期/篡改/并发续期/并发轮换/撤销/故障回退/审计
+go test -v ./internal/evidence     # 证据导出/离线核验/缺号/重排重复/改写/上限/并发
 ```
 
 测试以 `-v` 运行时会打印每个场景的**输入**与**判定依据**（`input:` /
@@ -261,4 +381,20 @@ go test -v ./internal/gateway      # 过期/篡改/并发续期/并发轮换/撤
 - 8 路并发轮换：恰好 1 次成功，最终唯一 active；
 - 撤销与判定并发：撤销完成后结论稳定为 `session_revoked`；
 - 存储故障注入：失败不留会话、不残留部分写入、后续请求自愈；
-- 策略删除后回退为默认拒绝；审计容量打满后敏感操作被拒。
+- 策略删除后回退为默认拒绝；审计容量打满后敏感操作被拒；
+- 审计证据导出后交给独立核验通过；缺号、重复/重排、内容改写（含嵌套
+  `detail`）、链根不符、签名失效分别得到可区分结论；
+- 外部改动导出副本（含嵌套内容）后：服务端记录不变、服务端再次导出字节
+  一致且仍核验通过；同一份未改动产物可重复核验；
+- 并发导出与敏感写入同时进行：每次导出都是连续无半条记录的一致边界、可离线
+  核验；同一范围重复导出字节一致；
+- 超条数/超字节上限：明确拒绝、原因可区分、不产生半成品，拒绝后再导出正常；
+- 产物不含凭证原文与签名密钥，只保留非敏感的 `jti` 引用。
+
+### 7.4 独立核验工具退出码
+
+`cmd/audit-evidence-verify` 以退出码区分核验结论，便于外部流水线消费：
+`0=valid`、`2=invalid_range`、`3=missing_records`、`4=reordered_or_dup`、
+`5=content_tampered`、`6=root_mismatch`、`7=bad_evidence_signature`、
+`8=artifact_malformed`、`9=unsupported_key_alg`、`10=期望(key/范围)不符`、
+`1=用法/读取错误`。文件参数传 `-` 时从标准输入读取。

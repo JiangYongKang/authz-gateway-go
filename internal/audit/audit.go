@@ -79,13 +79,21 @@ func (l *Log) Append(e Event) (Event, error) {
 }
 
 // Since 返回 ID 大于 afterID 的记录（按 ID 升序），只读快照副本；
-// 调用方对返回值的任何修改都不可能改写日志内容。
+// 调用方对返回值（含嵌套 Detail map）的任何修改都不可能改写日志内容。
 func (l *Log) Since(afterID int64) ([]Event, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	out := make([]Event, 0, len(l.events))
 	for _, e := range l.events {
 		if e.ID > afterID {
+			if e.Detail != nil {
+				// 深拷贝嵌套 map，避免快照与日志共享底层 map。
+				cp := make(map[string]string, len(e.Detail))
+				for k, v := range e.Detail {
+					cp[k] = v
+				}
+				e.Detail = cp
+			}
 			out = append(out, e)
 		}
 	}

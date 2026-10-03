@@ -15,44 +15,51 @@ import (
 	"github.com/highcumontoa/authz-gateway-go/internal/authz"
 	"github.com/highcumontoa/authz-gateway-go/internal/cache"
 	"github.com/highcumontoa/authz-gateway-go/internal/config"
+	"github.com/highcumontoa/authz-gateway-go/internal/evidence"
 	"github.com/highcumontoa/authz-gateway-go/internal/store"
 	"github.com/highcumontoa/authz-gateway-go/internal/token"
 )
 
 // 拒绝/失败原因码（对各入口统一、可区分）。
 const (
-	ReasonOK                = "ok"
-	ReasonUserNotFound      = "user_not_found"
-	ReasonTokenMalformed    = "token_malformed"
-	ReasonBadSignature      = "bad_signature"
-	ReasonUnknownKey        = "unknown_signing_key"
-	ReasonIssuerMismatch    = "issuer_mismatch"
-	ReasonTokenExpired      = "token_expired"
-	ReasonTokenNotValidYet  = "token_not_valid_yet"
-	ReasonSessionRevoked    = "session_revoked"
-	ReasonSessionMissing    = "session_missing"
-	ReasonCredentialStale   = "credential_superseded"
-	ReasonNoMatchingPolicy  = "no_matching_policy"
-	ReasonExplicitDeny      = "explicit_deny"
-	ReasonResourceNotFound  = "resource_not_found"
-	ReasonTooManyAttributes = "too_many_attributes"
-	ReasonRuleSetTooLarge   = "rule_set_too_large"
-	ReasonLimitExceeded     = "limit_exceeded"
-	ReasonStorageFault      = "storage_failure"
-	ReasonAuditFailure      = "audit_failure"
-	ReasonKeyRetired        = "signing_key_retired"
-	ReasonRenewTooEarly     = "renew_outside_window"
-	ReasonBadRequest        = "bad_request"
+	ReasonOK                 = "ok"
+	ReasonUserNotFound       = "user_not_found"
+	ReasonTokenMalformed     = "token_malformed"
+	ReasonBadSignature       = "bad_signature"
+	ReasonUnknownKey         = "unknown_signing_key"
+	ReasonIssuerMismatch     = "issuer_mismatch"
+	ReasonTokenExpired       = "token_expired"
+	ReasonTokenNotValidYet   = "token_not_valid_yet"
+	ReasonSessionRevoked     = "session_revoked"
+	ReasonSessionMissing     = "session_missing"
+	ReasonCredentialStale    = "credential_superseded"
+	ReasonNoMatchingPolicy   = "no_matching_policy"
+	ReasonExplicitDeny       = "explicit_deny"
+	ReasonResourceNotFound   = "resource_not_found"
+	ReasonTooManyAttributes  = "too_many_attributes"
+	ReasonRuleSetTooLarge    = "rule_set_too_large"
+	ReasonLimitExceeded      = "limit_exceeded"
+	ReasonStorageFault       = "storage_failure"
+	ReasonAuditFailure       = "audit_failure"
+	ReasonKeyRetired         = "signing_key_retired"
+	ReasonRenewTooEarly      = "renew_outside_window"
+	ReasonBadRequest         = "bad_request"
+	ReasonExportInvalidRange = "export_invalid_range"
+	ReasonExportUnavailable  = "export_range_unavailable"
+	ReasonExportTooMany      = "export_too_many_records"
+	ReasonExportTooLarge     = "export_too_large"
 )
 
 // Gateway 是服务的核心编排器。
 type Gateway struct {
-	cfg   config.Config
-	store *store.Store
-	eng   *authz.Engine
-	aud   *audit.Log
-	cache *cache.LRU[string, cacheEntry]
-	now   func() time.Time
+	cfg      config.Config
+	store    *store.Store
+	eng      *authz.Engine
+	aud      *audit.Log
+	cache    *cache.LRU[string, cacheEntry]
+	exporter *evidence.Exporter
+	evKey    *evidence.ExportKey
+	now      func() time.Time
 }
 
 type cacheEntry struct {
@@ -74,14 +81,37 @@ func New(cfg config.Config) *Gateway {
 	now := time.Now
 	st.SetClock(now)
 	aud.SetClock(now)
-	return &Gateway{
+	// 导出证据签名密钥：优先使用注入种子，否则随机生成。
+	evKey := newEvidenceKey(cfg.AuditEvidenceKeySeed)
+	g := &Gateway{
 		cfg:   cfg,
 		store: st,
 		eng:   authz.NewEngine(cfg.MaxRuleCount),
 		aud:   aud,
 		cache: cache.NewLRU[string, cacheEntry](cfg.DecisionCache),
+		exporter: evidence.NewExporter(aud, evKey, evidence.Limits{
+			MaxRecords: cfg.AuditExportMaxRecords,
+			MaxBytes:   cfg.AuditExportMaxBytes,
+		}),
+		evKey: evKey,
 		now:   now,
 	}
+	return g
+}
+
+// newEvidenceKey 从可选种子构造导出密钥；种子非法或未提供时退回随机密钥，
+// 随机生成也失败（极不可能）时返回 nil，导出将明确报未初始化而非崩溃。
+func newEvidenceKey(seed []byte) *evidence.ExportKey {
+	if len(seed) > 0 {
+		if k, err := evidence.ExportKeyFromSeed(seed); err == nil {
+			return k
+		}
+	}
+	k, err := evidence.NewExportKey()
+	if err != nil {
+		return nil
+	}
+	return k
 }
 
 // SetClock 注入统一时间源（测试用），存储与审计同步使用。
