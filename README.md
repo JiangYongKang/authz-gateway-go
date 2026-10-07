@@ -140,6 +140,13 @@
 - 所有敏感操作都留痕：`issue / verify / renew / revoke / authorize /
   admin_policy_* / admin_assign_roles / admin_key_*`。
 - 记录**只追加**：ID 严格单调递增，返回的是防御性拷贝，外部无法改写。
+- **读取与服务端历史互相独立**：`Append` 的返回值、`Since` 的查询结果、
+  `Export` 的导出产物，都是与服务端历史**不共享任何引用**的深拷贝
+  （含嵌套的 `Detail`）。调用方无论怎么读、怎么转发、是否就地改动
+  取到或返回的记录（顶层字段或嵌套内容），都**不可能**改写服务端
+  已记录的历史；之后按同一序号再查、按同一范围再导出，拿到的仍是
+  最初写入的原值。多个读取方并发读取同一段记录并各自改动时，
+  彼此互不影响，服务端记录保持原值。
 - **绝不写入敏感内容**：凭证只记录 `jti`（不记 token 本体），不记任何
   签名密钥；`GET /v1/audit` 亦不回传敏感材料。
 - 审计容量（`AuditCapacity`）写满后 `Append` 返回 `ErrAuditFull`，
@@ -294,7 +301,19 @@ go test ./...                      # 全量
 go test -race ./...                # 含数据竞争检测
 go test -v ./internal/authz        # 冲突规则/默认拒绝/ABAC/规模上限
 go test -v ./internal/gateway      # 过期/篡改/并发续期/并发轮换/撤销/故障回退/审计
+go test -v -race ./internal/audit  # 审计只追加/容量拒绝/证据导出核验/读取隔离
 ```
+
+本地复现与验证「读取不影响服务端历史」：
+
+```bash
+go test -v -race -run 'Isolated' ./internal/audit
+```
+
+覆盖：改 `Since` 结果的顶层字段、改嵌套 `Detail`、改动后再查再导出仍是原值
+（导出与改动前逐字节一致）、`Append` 返回值事后被改、16 路并发读取各自改动
+互不影响。每个用例的日志都打印输入（取到/返回的记录与改动方式）与结论
+（再查/再导出仍为原值）。
 
 测试以 `-v` 运行时会打印每个场景的**输入**与**判定依据**（`input:` /
 `decision basis:` / 命中规则 / 拒绝原因）。重点场景：
@@ -311,3 +330,6 @@ go test -v ./internal/gateway      # 过期/篡改/并发续期/并发轮换/撤
   改写（含嵌套 detail）判 `tampered`，范围不合法判 `invalid_range`；
   外部改动导出副本不影响服务端记录与再次导出；并发导出与写入自洽；
   超 `MaxExport` 明确拒绝（`export_limit_exceeded`）且不留半成品。
+- 审计读取隔离：改 `Since` 结果的顶层/嵌套字段、改 `Append` 返回值、
+  多读取方并发各自改动，均不影响服务端历史；再查、再导出仍是原值，
+  同一范围重复导出逐字节一致。

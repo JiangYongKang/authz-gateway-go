@@ -53,7 +53,9 @@ func (l *Log) SetClock(f func() time.Time) {
 // Append 追加一条不可变记录，返回分配后的记录（含 ID 与时间）。
 // 容量耗尽时返回 ErrAuditFull，调用方必须据此拒绝对应敏感操作。
 //
-// 注意：Event 以值拷贝保存；调用方事后修改入参 map 不影响已写入记录。
+// 注意：Event 以值拷贝保存，Detail map 逐条复制；调用方事后修改入参
+// 不影响已写入记录。返回值同样是独立深拷贝：调用方事后改动返回记录
+// 的任意一层（含嵌套 Detail），都不会影响服务端已存下的历史。
 func (l *Log) Append(e Event) (Event, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -66,6 +68,16 @@ func (l *Log) Append(e Event) (Event, error) {
 	if e.Time.IsZero() {
 		e.Time = l.now()
 	}
+	// 入栈与返回值各自持有独立的 Detail 副本，互不共享。
+	stored := cloneEvent(e)
+	// 追加到独立后备数组的切片，避免与外部缓冲区共享底层数组。
+	l.events = append(l.events, stored)
+	return cloneEvent(stored), nil
+}
+
+// cloneEvent 返回事件的深拷贝：结构体按值复制，Detail map 逐条复制，
+// 使拷贝与原事件不共享任何可就地修改的引用。
+func cloneEvent(e Event) Event {
 	if e.Detail != nil {
 		cp := make(map[string]string, len(e.Detail))
 		for k, v := range e.Detail {
@@ -73,20 +85,18 @@ func (l *Log) Append(e Event) (Event, error) {
 		}
 		e.Detail = cp
 	}
-	// 追加到独立后备数组的切片，避免与外部缓冲区共享底层数组。
-	l.events = append(l.events, e)
-	return e, nil
+	return e
 }
 
-// Since 返回 ID 大于 afterID 的记录（按 ID 升序），只读快照副本；
-// 调用方对返回值的任何修改都不可能改写日志内容。
+// Since 返回 ID 大于 afterID 的记录（按 ID 升序），深拷贝快照；
+// 调用方对返回值的任何修改（含嵌套的 Detail）都不可能改写日志内容。
 func (l *Log) Since(afterID int64) ([]Event, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	out := make([]Event, 0, len(l.events))
 	for _, e := range l.events {
 		if e.ID > afterID {
-			out = append(out, e)
+			out = append(out, cloneEvent(e))
 		}
 	}
 	return out, nil
