@@ -86,19 +86,12 @@ func (l *Log) Export(from, to int64, maxRecords int) (Evidence, error) {
 		l.mu.Unlock()
 		return Evidence{}, ErrExportLimit
 	}
-	// 深拷贝：事件值拷贝 + Detail map 逐条复制，
-	// 调用方事后如何改动产物都不可能影响日志本体。
+	// 深拷贝：事件值拷贝 + Detail map 逐条复制（与 Since/Append 共用
+	// 同一 cloneEvent 实现），调用方事后如何改动产物都不可能影响日志本体。
 	src := l.events[from-1 : to]
 	events := make([]Event, len(src))
 	for i, e := range src {
-		if e.Detail != nil {
-			cp := make(map[string]string, len(e.Detail))
-			for k, v := range e.Detail {
-				cp[k] = v
-			}
-			e.Detail = cp
-		}
-		events[i] = e
+		events[i] = cloneEvent(e)
 	}
 	l.mu.Unlock()
 
